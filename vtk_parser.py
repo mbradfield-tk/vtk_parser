@@ -1,16 +1,38 @@
-import pyvista as pv
-import numpy as np
+"""
+vtk_parser.py - Convert an M-Star CFD volume output (.vti) to legacy VTK (.vtk).
+
+Selects a single time step from <model_path>/out/Output/Volume/block0
+(the last one by default), renames arrays to the names expected by the
+compartment model (see RENAME), and writes a binary legacy VTK file.
+
+Usage:
+    python3 vtk_parser.py <model_path> [-t TIME] [-o OUTPUT_DIR]
+
+Arguments:
+    model_path          M-Star case directory (the folder containing "out/")
+    -t, --time TIME     Simulation time [s] to convert; the nearest available
+                        time step is used. Default: last time step
+    -o, --output-dir    Output directory. Default: <model_path>/out/VTK_from_VTI
+
+Examples:
+    python3 vtk_parser.py /data2/mstar/tak360/step9/1_TAK-360_S9_142L_76rpm_PostSeed_50C
+    python3 vtk_parser.py /path/to/case -t 25
+    python3 vtk_parser.py /path/to/case -t 25 -o /path/to/vtk_out
+
+Requires: pyvista (tested with 0.49). Output is legacy VTK file version 5.1.
+"""
+import argparse
+import re
+import sys
 from pathlib import Path
 
-vtk_directory = "/Users/eqb7202/Library/CloudStorage/OneDrive-Takeda/Documents/Projects/TAK360/Step9_crystalization/CompartmentModel/VTK/surfaceFields/surfaceFields_20000.vtk"
+import pyvista as pv
 
-model_path = "/Users/eqb7202/Library/CloudStorage/OneDrive-Takeda/Documents/Projects/TAK360/Step9_crystallization/MStar/"
-# create path to vti files directory
-vti_path = Path(model_path) / "vti"
-vtk_path = Path(model_path) / "vtk"
-vtk_path.mkdir(exist_ok=True)
-print(f"Converting VTI files in {vti_path} to legacy VTK format in {vtk_path}")
+VTI_SUBDIR = Path("out/Output/Volume/block0")
+VTK_SUBDIR = Path("out/VTK_from_VTI")
+VTI_PATTERN = re.compile(r"^Volume\.(.+)\.vti$")
 
+# only EDR and U are needed in the compartment model (MB; 2026.10.28)
 RENAME = {"Energy Dissipation Rate (W/kg)" : "epsilon",
           "Velocity Vector (m/s)" : "U",
           "Velocity Magnitude (m/s)" : "mag(U)",
@@ -41,27 +63,66 @@ def print_arrays(ds: pv.DataSet, label: str = ""):
     print()
 
 
-# convert VTI files to legacy VTK format
-for f in sorted(vti_path.glob("*.vti")):
-    try:
-        ds = pv.read(f)                          # auto-selects vtkXMLImageDataReader
+def find_vti_files(vti_dir: Path) -> list[tuple[float, Path]]:
+    """Return (time, path) pairs sorted numerically by the time encoded in the filename."""
+    files = []
+    for f in vti_dir.glob("Volume.*.vti"):
+        m = VTI_PATTERN.match(f.name)
+        try:
+            files.append((float(m.group(1)), f))
+        except (AttributeError, ValueError):
+            print(f"Skipping unrecognized file name: {f.name}")
+    # Lexicographic sort is wrong here (e.g. 9.0e+00 > 3.0e+01 as strings)
+    return sorted(files, key=lambda tf: tf[0])
 
-        print_arrays(ds, label="BEFORE (VTI)")
 
-        # rename field variables to match compartment model format
-        for old, new in RENAME.items():
-            if old in ds.point_data:
-                ds.rename_array(old, new, preference="point")
-            if old in ds.cell_data:
-                ds.rename_array(old, new, preference="cell")
-            if old in ds.field_data:
-                ds.rename_array(old, new, preference="field")
+def select_vti(files: list[tuple[float, Path]], time: float | None) -> tuple[float, Path]:
+    if time is None:
+        return files[-1]
+    t, f = min(files, key=lambda tf: abs(tf[0] - time))
+    if abs(t - time) > 1e-3 * max(abs(time), 1.0):
+        print(f"Warning: no VTI at t={time}; using nearest t={t}")
+    return t, f
 
-        out_path = vtk_path / (f.stem + ".vtk")
-        ds.save(out_path)     # writes legacy .vtk
 
-        ds_written = pv.read(out_path)  # sanity check  [1](https://docs.pyvista.org/api/core/_autosummary/pyvista.dataset.rename_array)
-        print_arrays(ds_written, label="AFTER  (VTK)")
+def convert(vti_file: Path, out_dir: Path) -> Path:
+    ds = pv.read(vti_file)
+    print_arrays(ds, label="BEFORE (VTI)")
 
-    except Exception as e:
-        print(f"Failed to convert {f} to VTK: {e}")
+    # rename field variables to match compartment model format
+    for old, new in RENAME.items():
+        for assoc, dsa in (("point", ds.point_data), ("cell", ds.cell_data), ("field", ds.field_data)):
+            if old in dsa:
+                ds.rename_array(old, new, preference=assoc)
+
+    out_path = out_dir / (vti_file.stem + ".vtk")
+    ds.save(out_path)  # .vtk extension -> legacy writer
+
+    print_arrays(pv.read(out_path), label="AFTER  (VTK)")
+    return out_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert an M-Star VTI volume file to legacy VTK.")
+    parser.add_argument("model_path", type=Path, help="M-Star case directory (contains out/Output/Volume/block0)")
+    parser.add_argument("-t", "--time", type=float, default=None,
+                        help="Simulation time to convert (nearest match). Default: last time step")
+    parser.add_argument("-o", "--output-dir", type=Path, default=None,
+                        help=f"Output directory. Default: <model_path>/{VTK_SUBDIR}")
+    args = parser.parse_args()
+
+    vti_dir = args.model_path / VTI_SUBDIR
+    out_dir = args.output_dir or args.model_path / VTK_SUBDIR
+
+    files = find_vti_files(vti_dir)
+    if not files:
+        sys.exit(f"No Volume.*.vti files found in {vti_dir}")
+
+    t, vti_file = select_vti(files, args.time)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Converting {vti_file.name} (t={t}) -> {out_dir}")
+    print(f"Wrote {convert(vti_file, out_dir)}")
+
+
+if __name__ == "__main__":
+    main()
